@@ -1,0 +1,511 @@
+#!/bin/bash
+#
+# mac-release-verify — check a macOS release artifact before you ship it.
+#
+# Everything a Mac app has to get right at the moment of shipping is spread
+# across separate places: the signature, the notarization ticket, the ticket on
+# the *disk image* as well as the app, the build number Sparkle actually reads,
+# the appcast that has to agree with the binary, the dSYM that makes crash
+# reports readable. Each one fails silently. The build stays green.
+#
+# This tool only reads. It never signs, uploads, mutates or publishes anything.
+#
+# Usage:
+#   mac-release-verify <app-or-dmg> [options]
+#
+# Options:
+#   --appcast <path|url>    Cross-check a Sparkle appcast against the artifact
+#   --dsym <path>           .dSYM bundle, or a directory/.xcarchive containing one
+#   --previous-build <n>    Assert the build number increased since this one
+#   --no-network            Skip every check that touches the network
+#   --no-secrets            Skip the bundled-secrets scan
+#   --format text|github    Output style (github = GitHub Actions annotations)
+#   --quiet                 Only print failures and the summary
+#   -h, --help              This text
+#
+# Exit codes: 0 = all checks passed, 1 = at least one failed, 2 = usage error.
+#
+# Requires only tools shipped with macOS: codesign, spctl, stapler, hdiutil,
+# PlistBuddy, dwarfdump, lipo, xmllint, curl. Targets bash 3.2 (the /bin/bash
+# that macOS ships), so it runs on a stock machine with nothing installed.
+
+set -u
+
+VERSION="0.1.0"
+
+# ---------------------------------------------------------------- presentation
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[0;33m'
+  C_DIM=$'\033[2m'; C_BLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_RED=''; C_GRN=''; C_YEL=''; C_DIM=''; C_BLD=''; C_OFF=''
+fi
+
+N_PASS=0; N_FAIL=0; N_WARN=0; N_SKIP=0
+FAILED_REPORT=""
+CURRENT_CHECK=""
+FORMAT="text"
+QUIET=""
+
+say() { [ -n "$QUIET" ] || printf '%s\n' "$*"; }
+
+check() { CURRENT_CHECK="$1"; }
+
+ok() {
+  N_PASS=$((N_PASS + 1))
+  [ -n "$QUIET" ] || printf '  %sPASS%s  %s%s%s\n' "$C_GRN" "$C_OFF" "$C_DIM" "$CURRENT_CHECK" "$C_OFF"
+}
+
+# fail <consequence> [fix]
+fail() {
+  N_FAIL=$((N_FAIL + 1))
+  printf '  %sFAIL%s  %s%s%s\n' "$C_RED" "$C_OFF" "$C_BLD" "$CURRENT_CHECK" "$C_OFF"
+  printf '        %s\n' "$1"
+  if [ -n "${2:-}" ]; then printf '        %sfix:%s %s\n' "$C_DIM" "$C_OFF" "$2"; fi
+  FAILED_REPORT="${FAILED_REPORT}${CURRENT_CHECK}"$'\n'
+  if [ "$FORMAT" = "github" ]; then
+    printf '::error title=%s::%s\n' "$CURRENT_CHECK" "$1"
+  fi
+}
+
+warn() {
+  N_WARN=$((N_WARN + 1))
+  [ -n "$QUIET" ] || {
+    printf '  %sWARN%s  %s\n' "$C_YEL" "$C_OFF" "$CURRENT_CHECK"
+    printf '        %s\n' "$1"
+  }
+  if [ "$FORMAT" = "github" ]; then
+    printf '::warning title=%s::%s\n' "$CURRENT_CHECK" "$1"
+  fi
+}
+
+skip() {
+  N_SKIP=$((N_SKIP + 1))
+  [ -n "$QUIET" ] || printf '  %sSKIP%s  %s%s — %s%s\n' "$C_DIM" "$C_OFF" "$C_DIM" "$CURRENT_CHECK" "$1" "$C_OFF"
+}
+
+die() { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$1" >&2; exit 2; }
+
+usage() { sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+# ------------------------------------------------------------------ arguments
+
+TARGET=""
+APPCAST=""
+DSYM_HINT=""
+PREV_BUILD=""
+DO_NETWORK=1
+DO_SECRETS=1
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage ;;
+    --version) echo "mac-release-verify $VERSION"; exit 0 ;;
+    --appcast) shift; APPCAST="${1:-}" ;;
+    --dsym) shift; DSYM_HINT="${1:-}" ;;
+    --previous-build) shift; PREV_BUILD="${1:-}" ;;
+    --no-network) DO_NETWORK=0 ;;
+    --no-secrets) DO_SECRETS=0 ;;
+    --quiet) QUIET=1 ;;
+    --format) shift; FORMAT="${1:-text}" ;;
+    -*) die "unknown option: $1" ;;
+    *) [ -z "$TARGET" ] && TARGET="$1" || die "more than one target given" ;;
+  esac
+  shift
+done
+
+[ -n "$TARGET" ] || die "no target. usage: mac-release-verify <app-or-dmg> [options]"
+[ -e "$TARGET" ] || die "no such file: $TARGET"
+
+case "$TARGET" in
+  /*) ;;
+  *) TARGET="$PWD/$TARGET" ;;
+esac
+
+# ------------------------------------------------------------------- mounting
+
+MOUNT_POINT=""
+cleanup() {
+  if [ -n "$MOUNT_POINT" ] && [ -d "$MOUNT_POINT" ]; then
+    hdiutil detach "$MOUNT_POINT" -quiet -force >/dev/null 2>&1
+    rmdir "$MOUNT_POINT" >/dev/null 2>&1
+  fi
+}
+trap cleanup EXIT INT TERM
+
+IS_DMG=0
+APP=""
+
+case "$TARGET" in
+  *.dmg)
+    IS_DMG=1
+    MOUNT_POINT=$(mktemp -d /tmp/mac-release-verify.XXXXXX) || die "cannot create mount point"
+    if ! hdiutil attach "$TARGET" -nobrowse -readonly -noverify -mountpoint "$MOUNT_POINT" >/dev/null 2>&1; then
+      die "cannot mount disk image: $TARGET"
+    fi
+    APP=$(find "$MOUNT_POINT" -maxdepth 2 -name '*.app' -type d 2>/dev/null | head -1)
+    [ -n "$APP" ] || die "no .app found inside the disk image"
+    ;;
+  *.app)
+    APP="$TARGET"
+    ;;
+  *.xcarchive)
+    APP=$(find "$TARGET/Products/Applications" -maxdepth 1 -name '*.app' -type d 2>/dev/null | head -1)
+    [ -n "$APP" ] || die "no .app found inside the archive"
+    [ -n "$DSYM_HINT" ] || DSYM_HINT="$TARGET"
+    ;;
+  *)
+    die "target must be a .app, .dmg or .xcarchive"
+    ;;
+esac
+
+PLIST="$APP/Contents/Info.plist"
+[ -f "$PLIST" ] || die "no Info.plist in $APP"
+
+plist_get() { /usr/libexec/PlistBuddy -c "Print :$1" "$PLIST" 2>/dev/null; }
+
+SHORT_VERSION=$(plist_get CFBundleShortVersionString)
+BUILD_VERSION=$(plist_get CFBundleVersion)
+EXECUTABLE_NAME=$(plist_get CFBundleExecutable)
+MIN_SYSTEM=$(plist_get LSMinimumSystemVersion)
+ED_PUBKEY=$(plist_get SUPublicEDKey)
+FEED_URL=$(plist_get SUFeedURL)
+BINARY="$APP/Contents/MacOS/$EXECUTABLE_NAME"
+
+# --------------------------------------------------------------------- header
+
+say ""
+say "${C_BLD}mac-release-verify${C_OFF} $VERSION"
+say ""
+say "  target   $(basename "$TARGET")"
+say "  app      $(basename "$APP")  ${C_BLD}${SHORT_VERSION:-?} (${BUILD_VERSION:-?})${C_OFF}"
+say ""
+
+# ============================================================== 1. signature
+
+check "code signature"
+CS_OUT=$(codesign --verify --deep --strict --verbose=2 "$APP" 2>&1)
+if [ $? -eq 0 ]; then
+  ok
+else
+  fail "The app is not validly signed, so macOS will refuse to launch it: ${CS_OUT}" \
+       "codesign --force --options runtime --sign \"Developer ID Application: ...\" \"\$APP\""
+fi
+
+# ============================================================== 2. gatekeeper
+
+check "Gatekeeper assessment (app)"
+GK_OUT=$(spctl --assess --type exec --verbose=4 "$APP" 2>&1)
+if [ $? -eq 0 ]; then
+  ok
+else
+  fail "Gatekeeper rejects the app: ${GK_OUT}. Users see \"can't be opened because Apple cannot check it for malicious software\"." \
+       "Notarize the app, then: xcrun stapler staple \"\$APP\""
+fi
+
+# ========================================================== 3. hardened runtime
+
+check "hardened runtime and secure timestamp"
+CS_INFO=$(codesign -d --verbose=2 "$APP" 2>&1)
+HAS_RUNTIME=$(printf '%s' "$CS_INFO" | grep -c 'flags=.*runtime')
+HAS_TIMESTAMP=$(printf '%s' "$CS_INFO" | grep -c 'Timestamp=')
+if [ "$HAS_RUNTIME" -gt 0 ] && [ "$HAS_TIMESTAMP" -gt 0 ]; then
+  ok
+elif [ "$HAS_RUNTIME" -eq 0 ]; then
+  fail "The app is signed without the hardened runtime. Apple's notary service rejects such builds." \
+       "Add --options runtime when signing (ENABLE_HARDENED_RUNTIME = YES)."
+else
+  fail "The signature has no secure timestamp, so it stops validating once the certificate expires." \
+       "Sign with --timestamp (not --timestamp=none)."
+fi
+
+# ================================================ 4. notarization ticket (app)
+
+check "notarization ticket (app)"
+if xcrun stapler validate "$APP" >/dev/null 2>&1; then
+  ok
+else
+  fail "The app has no stapled notarization ticket. On a Mac that cannot reach Apple's notary service the app will not open at all." \
+       "xcrun notarytool submit ... && xcrun stapler staple \"\$APP\""
+fi
+
+# ========================================= 5. notarization ticket (disk image)
+# The failure this whole tool exists for: notarizing the .app and then wrapping
+# it in a DMG leaves the DMG itself unnotarized. Gatekeeper inspects the DMG at
+# the moment the user opens the download, so the app's own ticket never gets a
+# chance to matter.
+
+check "notarization ticket (disk image)"
+if [ "$IS_DMG" -eq 1 ]; then
+  if xcrun stapler validate "$TARGET" >/dev/null 2>&1; then
+    ok
+  else
+    fail "The app is stapled but the disk image is not. Gatekeeper checks the disk image when the user opens the download, so this blocks every download even though the app inside is fine." \
+         "xcrun notarytool submit \"$(basename "$TARGET")\" --wait ... && xcrun stapler staple \"$(basename "$TARGET")\""
+  fi
+else
+  skip "target is not a disk image"
+fi
+
+# ======================================================= 6. disk image signing
+
+check "disk image signature"
+if [ "$IS_DMG" -eq 1 ]; then
+  if codesign --verify --verbose=2 "$TARGET" >/dev/null 2>&1; then
+    ok
+  else
+    fail "The disk image itself is unsigned. Signing it lets macOS tell an intact download from a corrupted or tampered one." \
+         "codesign --sign \"Developer ID Application: ...\" \"$(basename "$TARGET")\""
+  fi
+else
+  skip "target is not a disk image"
+fi
+
+# ==================================================== 7. version identity
+
+check "version identity"
+if [ -z "$SHORT_VERSION" ] || [ -z "$BUILD_VERSION" ]; then
+  fail "CFBundleShortVersionString or CFBundleVersion is missing, so no update mechanism can order this build against another." \
+       "Set MARKETING_VERSION and CURRENT_PROJECT_VERSION in your build settings."
+elif ! printf '%s' "$BUILD_VERSION" | grep -Eq '^[0-9]+([.][0-9]+)*$'; then
+  fail "CFBundleVersion is \"$BUILD_VERSION\", which is not a number. Sparkle and App Store Connect both order builds numerically." \
+       "Use a monotonically increasing integer for CURRENT_PROJECT_VERSION."
+elif [ "$SHORT_VERSION" = "$BUILD_VERSION" ]; then
+  warn "CFBundleShortVersionString and CFBundleVersion are both \"$SHORT_VERSION\". Sparkle compares the *build* number; if you only ever bump the marketing version, updates stop being offered."
+else
+  ok
+fi
+
+# ================================================ 8. build number monotonicity
+# Sparkle decides whether an update exists by comparing CFBundleVersion, not
+# the marketing version. Ship 2.1.1 with the build number of 2.1.0 and every
+# existing user is told they are already up to date.
+
+check "build number increased"
+if [ -z "$PREV_BUILD" ]; then
+  skip "no --previous-build given"
+elif [ -z "$BUILD_VERSION" ]; then
+  skip "no build number to compare"
+elif [ "$BUILD_VERSION" = "$PREV_BUILD" ]; then
+  fail "The build number is still $BUILD_VERSION, the same as the previous release. Sparkle compares CFBundleVersion, so every existing user will be told they are already up to date and the update will never install." \
+       "Bump CURRENT_PROJECT_VERSION."
+elif [ "$(printf '%s\n%s\n' "$PREV_BUILD" "$BUILD_VERSION" | sort -t. -k1,1n -k2,2n | tail -1)" = "$PREV_BUILD" ]; then
+  fail "The build number went backwards: $PREV_BUILD → $BUILD_VERSION. No existing user will be offered this update." \
+       "Bump CURRENT_PROJECT_VERSION above $PREV_BUILD."
+else
+  ok
+fi
+
+# ========================================================= 9. appcast agreement
+
+APPCAST_FILE=""
+check "appcast agreement"
+if [ -z "$APPCAST" ]; then
+  skip "no --appcast given"
+else
+  if printf '%s' "$APPCAST" | grep -q '^https\{0,1\}://'; then
+    if [ "$DO_NETWORK" -eq 0 ]; then
+      skip "--no-network, appcast is a URL"
+    else
+      APPCAST_FILE=$(mktemp /tmp/mrv-appcast.XXXXXX)
+      curl -fsSL --max-time 20 "$APPCAST" -o "$APPCAST_FILE" 2>/dev/null || APPCAST_FILE=""
+      [ -n "$APPCAST_FILE" ] || fail "Could not download the appcast from $APPCAST. If this is the live feed, no user can currently check for updates." ""
+    fi
+  else
+    [ -f "$APPCAST" ] && APPCAST_FILE="$APPCAST" || fail "No such appcast file: $APPCAST" ""
+  fi
+fi
+
+xp() { xmllint --xpath "$1" "$APPCAST_FILE" 2>/dev/null; }
+
+if [ -n "$APPCAST_FILE" ]; then
+  # Sparkle allows sparkle:version either as a child element or as an enclosure
+  # attribute. Read both so the check does not depend on which generator wrote it.
+  AC_VERSION=$(xp "string(//item[1]/*[local-name()='version'])")
+  [ -n "$AC_VERSION" ] || AC_VERSION=$(xp "string(//item[1]/enclosure/@*[local-name()='version'])")
+  AC_SHORT=$(xp "string(//item[1]/*[local-name()='shortVersionString'])")
+  [ -n "$AC_SHORT" ] || AC_SHORT=$(xp "string(//item[1]/enclosure/@*[local-name()='shortVersionString'])")
+  AC_LENGTH=$(xp "string(//item[1]/enclosure/@length)")
+  AC_URL=$(xp "string(//item[1]/enclosure/@url)")
+  AC_SIG=$(xp "string(//item[1]/enclosure/@*[local-name()='edSignature'])")
+
+  AC_PROBLEMS=""
+  [ "$AC_VERSION" = "$BUILD_VERSION" ] || \
+    AC_PROBLEMS="${AC_PROBLEMS}sparkle:version is $AC_VERSION but the shipped build is $BUILD_VERSION. "
+  [ -z "$AC_SHORT" ] || [ "$AC_SHORT" = "$SHORT_VERSION" ] || \
+    AC_PROBLEMS="${AC_PROBLEMS}shortVersionString is $AC_SHORT but the app says $SHORT_VERSION. "
+  if [ "$IS_DMG" -eq 1 ] && [ -n "$AC_LENGTH" ]; then
+    REAL_SIZE=$(stat -f%z "$TARGET")
+    [ "$AC_LENGTH" = "$REAL_SIZE" ] || \
+      AC_PROBLEMS="${AC_PROBLEMS}enclosure length is $AC_LENGTH but the disk image is $REAL_SIZE bytes. "
+  fi
+  [ -n "$AC_SIG" ] || AC_PROBLEMS="${AC_PROBLEMS}no sparkle:edSignature on the enclosure. "
+
+  if [ -z "$AC_PROBLEMS" ]; then
+    ok
+  else
+    fail "The appcast disagrees with the artifact you are about to ship: ${AC_PROBLEMS}Sparkle trusts the appcast, so users get told about a version that is not what you built." \
+         "Regenerate the appcast from the built disk image, not from your build settings."
+  fi
+
+  # -------------------------------------------- 9b. signing key present locally
+  check "appcast signature key"
+  if [ -z "$ED_PUBKEY" ]; then
+    warn "The app has no SUPublicEDKey in Info.plist, so Sparkle cannot verify update signatures at all."
+  elif [ -z "$AC_SIG" ]; then
+    skip "no edSignature in the appcast to check against"
+  else
+    ok
+  fi
+
+  # ------------------------------------------------ 10. enclosure reachability
+  check "appcast download URL reachable"
+  if [ "$DO_NETWORK" -eq 0 ]; then
+    skip "--no-network"
+  elif [ -z "$AC_URL" ]; then
+    fail "The appcast item has no enclosure URL, so there is nothing for Sparkle to download." ""
+  else
+    HTTP_CODE=$(curl -sIL --max-time 20 -o /dev/null -w '%{http_code}' "$AC_URL" 2>/dev/null)
+    if [ "$HTTP_CODE" = "200" ]; then
+      ok
+    else
+      fail "The appcast points at $AC_URL, which returns HTTP ${HTTP_CODE:-no response}. Users will be offered an update that cannot be downloaded." \
+           "Publish the release asset before publishing the appcast."
+    fi
+  fi
+fi
+
+# ================================================================= 11. dSYM
+# Shipping without the matching dSYM does not break anything a user can see. It
+# breaks the thing you need *after* they hit a bug: every crash report from this
+# version arrives as unreadable addresses, for as long as the version is live.
+
+check "dSYM present and matching"
+if [ -z "$DSYM_HINT" ]; then
+  skip "no --dsym given"
+elif [ ! -e "$DSYM_HINT" ]; then
+  fail "No such dSYM path: $DSYM_HINT" ""
+elif [ ! -f "$BINARY" ]; then
+  skip "cannot locate the main executable"
+else
+  APP_UUIDS=$(dwarfdump --uuid "$BINARY" 2>/dev/null | awk '{print $2}' | sort)
+  if [ -d "$DSYM_HINT" ] && [ "${DSYM_HINT##*.}" = "dSYM" ]; then
+    DSYM_LIST="$DSYM_HINT"
+  else
+    DSYM_LIST=$(find "$DSYM_HINT" -maxdepth 4 -name '*.dSYM' -type d 2>/dev/null)
+  fi
+  if [ -z "$DSYM_LIST" ]; then
+    fail "No .dSYM was found under $DSYM_HINT. Every crash report from this version will arrive as raw addresses that cannot be symbolicated — and you cannot regenerate a dSYM after the fact." \
+         "Set DEBUG_INFORMATION_FORMAT = dwarf-with-dsym and archive again."
+  else
+    DSYM_UUIDS=""
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      DSYM_UUIDS="${DSYM_UUIDS}$(dwarfdump --uuid "$d" 2>/dev/null | awk '{print $2}')"$'\n'
+    done <<EOF
+$DSYM_LIST
+EOF
+    MISSING=""
+    for u in $APP_UUIDS; do
+      printf '%s' "$DSYM_UUIDS" | grep -q "$u" || MISSING="${MISSING}$u "
+    done
+    if [ -z "$MISSING" ]; then
+      ok
+    else
+      fail "The app binary has UUID(s) $MISSING with no matching dSYM. Crash reports for those slices cannot be symbolicated, and the dSYM cannot be produced later from a different build." \
+           "Archive and ship from the same build that produced the dSYM."
+    fi
+  fi
+fi
+
+# ================================================= 12. architectures / minimum
+
+check "architectures"
+if [ -f "$BINARY" ]; then
+  ARCHS=$(lipo -archs "$BINARY" 2>/dev/null)
+  if printf '%s' "$ARCHS" | grep -q 'x86_64' && printf '%s' "$ARCHS" | grep -q 'arm64'; then
+    ok
+  elif printf '%s' "$ARCHS" | grep -q 'arm64'; then
+    warn "The binary is arm64 only ($ARCHS). Intel Macs cannot run it. That is a legitimate choice — make sure your download page and appcast say so."
+  elif [ -z "$ARCHS" ]; then
+    fail "The main executable is not a Mach-O binary, so it is not a runnable app." ""
+  else
+    warn "Unexpected architecture set: $ARCHS"
+  fi
+else
+  skip "cannot locate the main executable"
+fi
+
+check "minimum system version declared"
+if [ -n "$MIN_SYSTEM" ]; then
+  ok
+else
+  warn "LSMinimumSystemVersion is not set, so macOS will let the app launch on systems you never tested."
+fi
+
+# ================================================ 13. embedded code is signed
+
+check "embedded frameworks and helpers signed"
+EMBEDDED=$(find "$APP/Contents" -maxdepth 3 \( -name '*.framework' -o -name '*.xpc' -o -name '*.appex' \) -type d 2>/dev/null)
+if [ -z "$EMBEDDED" ]; then
+  skip "no embedded frameworks, XPC services or extensions"
+else
+  BAD=""
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    codesign --verify --strict "$e" >/dev/null 2>&1 || BAD="${BAD}$(basename "$e") "
+  done <<EOF
+$EMBEDDED
+EOF
+  if [ -z "$BAD" ]; then
+    ok
+  else
+    fail "Embedded code is not validly signed: $BAD. The app will fail to launch, or fail notarization." \
+         "Sign nested code inside-out, deepest first, before signing the app."
+  fi
+fi
+
+# ================================================== 14. secrets in the bundle
+
+check "no credentials shipped inside the bundle"
+if [ "$DO_SECRETS" -eq 0 ]; then
+  skip "--no-secrets"
+else
+  FOUND=""
+  DOTFILES=$(find "$APP/Contents" -maxdepth 4 \( -name '.env*' -o -name '*.p12' -o -name '*.pem' -o -name 'id_rsa*' -o -name '*.mobileprovision' \) -type f 2>/dev/null)
+  [ -z "$DOTFILES" ] || FOUND="$DOTFILES"
+  # Only scan small, text-shaped resources; a full binary sweep would be slow
+  # and noisy, and the real-world mistake is a copied config file.
+  SMALL=$(find "$APP/Contents/Resources" -maxdepth 3 -type f -size -256k \
+            \( -name '*.json' -o -name '*.plist' -o -name '*.txt' -o -name '*.yaml' -o -name '*.yml' -o -name '*.js' \) 2>/dev/null | head -400)
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if LC_ALL=C grep -Eql '(sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[baprs]-[A-Za-z0-9-]{10,})' "$f" 2>/dev/null; then
+      FOUND="${FOUND}
+$f"
+    fi
+  done <<EOF
+$SMALL
+EOF
+  if [ -z "$FOUND" ]; then
+    ok
+  else
+    fail "Credential-shaped files are inside the shipped bundle:$(printf '%s' "$FOUND" | sed 's|'"$APP"'|<app>|g' | tr '\n' ' '). Anyone who downloads the app can read them, and a released build cannot be recalled." \
+         "Remove them from Copy Bundle Resources and rotate anything that already shipped."
+  fi
+fi
+
+# ================================================================== summary
+
+say ""
+TOTAL=$((N_PASS + N_FAIL))
+if [ "$N_FAIL" -eq 0 ]; then
+  printf '  %s%d passed%s, %d warning(s), %d skipped\n' "$C_GRN" "$N_PASS" "$C_OFF" "$N_WARN" "$N_SKIP"
+  say ""
+  exit 0
+else
+  printf '  %s%d failed%s, %d passed, %d warning(s), %d skipped\n' "$C_RED" "$N_FAIL" "$C_OFF" "$N_PASS" "$N_WARN" "$N_SKIP"
+  say ""
+  exit 1
+fi

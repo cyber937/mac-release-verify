@@ -1,0 +1,17 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  negative-controls:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The script targets bash 3.2 on purpose — that is the /bin/bash a stock
+      # Mac has. Running it under a newer bash would not prove it works there.
+      - name: Check syntax under /bin/bash
+        run: /bin/bash -n bin/mac-release-verify
+      - name: Negative controls
+        run: ./tests/negative-controls.sh

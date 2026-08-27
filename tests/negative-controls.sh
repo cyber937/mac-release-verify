@@ -1,0 +1,160 @@
+#!/bin/bash
+#
+# Negative controls.
+#
+# A checker that only ever reports PASS is indistinguishable from a checker that
+# does nothing. Every check in this tool therefore has to be shown failing on an
+# artifact that is known to be broken, before a PASS from it means anything.
+#
+# These tests build deliberately broken artifacts and assert that the specific
+# check fires. They need no signing identity, no Apple account and no network.
+#
+#   ./tests/negative-controls.sh
+
+set -u
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+TOOL="$HERE/../bin/mac-release-verify"
+WORK="$(mktemp -d /tmp/mrv-tests.XXXXXX)"
+FAILURES=0
+RAN=0
+
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT INT TERM
+
+pass_msg() { printf '  ok    %s\n' "$1"; }
+fail_msg() { printf '  FAIL  %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
+
+# expect_check_fails <description> <check name> <output>
+expect_check_fails() {
+  RAN=$((RAN + 1))
+  if printf '%s' "$3" | grep -q "FAIL  $2"; then
+    pass_msg "$1"
+  else
+    fail_msg "$1 — expected a FAIL on \"$2\", got:"
+    printf '%s\n' "$3" | sed 's/^/          /'
+  fi
+}
+
+# expect_exit <description> <expected> <actual>
+expect_exit() {
+  RAN=$((RAN + 1))
+  if [ "$2" = "$3" ]; then pass_msg "$1"; else fail_msg "$1 — expected exit $2, got $3"; fi
+}
+
+# --------------------------------------------------------- build a broken app
+
+STAGE="$WORK/stage"
+APP="$STAGE/Broken.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+/usr/libexec/PlistBuddy \
+  -c "Add :CFBundleExecutable string Broken" \
+  -c "Add :CFBundleIdentifier string com.example.broken" \
+  -c "Add :CFBundleShortVersionString string 1.2.3" \
+  -c "Add :CFBundleVersion string 42" \
+  "$APP/Contents/Info.plist" >/dev/null
+# A real Mach-O so the architecture check has something to read. cc is present
+# wherever Xcode's command line tools are, which is a prerequisite anyway.
+printf 'int main(void){return 0;}\n' > "$WORK/main.c"
+cc -o "$APP/Contents/MacOS/Broken" "$WORK/main.c" 2>/dev/null || \
+  printf '#!/bin/sh\nexit 0\n' > "$APP/Contents/MacOS/Broken"
+chmod +x "$APP/Contents/MacOS/Broken"
+# The mistake this check exists for: a config file left in Copy Bundle Resources.
+printf '{"apiKey":"sk-NOTAREALKEY0000000000000000"}\n' > "$APP/Contents/Resources/config.json"
+
+echo ""
+echo "negative controls"
+echo ""
+
+# 1. unsigned app -----------------------------------------------------------
+OUT=$(NO_COLOR=1 "$TOOL" "$APP" --no-network 2>&1); CODE=$?
+expect_check_fails "unsigned app is caught"                "code signature"                    "$OUT"
+expect_check_fails "Gatekeeper rejection is caught"        "Gatekeeper assessment (app)"       "$OUT"
+expect_check_fails "missing hardened runtime is caught"    "hardened runtime and secure timestamp" "$OUT"
+expect_check_fails "missing notarization ticket is caught" "notarization ticket (app)"         "$OUT"
+expect_check_fails "credentials in the bundle are caught"  "no credentials shipped inside the bundle" "$OUT"
+expect_exit        "a broken artifact exits 1"             1 "$CODE"
+
+# 2. --no-secrets actually suppresses the secrets check ----------------------
+OUT=$(NO_COLOR=1 "$TOOL" "$APP" --no-network --no-secrets 2>&1)
+RAN=$((RAN + 1))
+if printf '%s' "$OUT" | grep -q "SKIP  no credentials"; then
+  pass_msg "--no-secrets skips the secrets scan"
+else
+  fail_msg "--no-secrets did not skip the secrets scan"
+fi
+
+# 3. build number that did not move ------------------------------------------
+OUT=$(NO_COLOR=1 "$TOOL" "$APP" --no-network --no-secrets --previous-build 42 2>&1)
+expect_check_fails "a build number that did not increase is caught" "build number increased" "$OUT"
+
+# 4. build number that went backwards ----------------------------------------
+OUT=$(NO_COLOR=1 "$TOOL" "$APP" --no-network --no-secrets --previous-build 99 2>&1)
+expect_check_fails "a build number that went backwards is caught" "build number increased" "$OUT"
+
+# 5. disk image path + appcast disagreement ----------------------------------
+rm -f "$WORK/Broken.dmg"
+if hdiutil create -volname Broken -srcfolder "$STAGE" -ov -quiet -format UDZO "$WORK/Broken.dmg" 2>/dev/null; then
+  REAL_SIZE=$(stat -f%z "$WORK/Broken.dmg")
+  cat > "$WORK/appcast.xml" <<EOF
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+  <channel>
+    <item>
+      <title>Version 1.2.3</title>
+      <sparkle:version>41</sparkle:version>
+      <sparkle:shortVersionString>1.2.2</sparkle:shortVersionString>
+      <enclosure url="https://example.invalid/Broken.dmg" length="$((REAL_SIZE - 1))"
+                 type="application/octet-stream" sparkle:edSignature="AAAA"/>
+    </item>
+  </channel>
+</rss>
+EOF
+  OUT=$(NO_COLOR=1 "$TOOL" "$WORK/Broken.dmg" --appcast "$WORK/appcast.xml" --no-network --no-secrets 2>&1)
+  expect_check_fails "an unstapled disk image is caught"   "notarization ticket (disk image)" "$OUT"
+  expect_check_fails "an unsigned disk image is caught"    "disk image signature"             "$OUT"
+  expect_check_fails "an appcast that disagrees is caught" "appcast agreement"                "$OUT"
+
+  RAN=$((RAN + 1))
+  if printf '%s' "$OUT" | grep -q "sparkle:version is 41 but the shipped build is 42"; then
+    pass_msg "the appcast failure names the actual mismatch"
+  else
+    fail_msg "the appcast failure did not name the version mismatch"
+  fi
+else
+  echo "  skip  disk image tests — hdiutil create failed"
+fi
+
+# 6. missing dSYM -------------------------------------------------------------
+mkdir -p "$WORK/empty-archive"
+OUT=$(NO_COLOR=1 "$TOOL" "$APP" --no-network --no-secrets --dsym "$WORK/empty-archive" 2>&1)
+expect_check_fails "a missing dSYM is caught" "dSYM present and matching" "$OUT"
+
+# 7. usage errors -------------------------------------------------------------
+NO_COLOR=1 "$TOOL" >/dev/null 2>&1; expect_exit "no argument exits 2" 2 "$?"
+NO_COLOR=1 "$TOOL" /nonexistent.dmg >/dev/null 2>&1; expect_exit "a missing file exits 2" 2 "$?"
+NO_COLOR=1 "$TOOL" "$APP" --nonsense >/dev/null 2>&1; expect_exit "an unknown option exits 2" 2 "$?"
+
+# 8. the tool leaves nothing mounted ------------------------------------------
+RAN=$((RAN + 1))
+if [ -f "$WORK/Broken.dmg" ]; then
+  NO_COLOR=1 "$TOOL" "$WORK/Broken.dmg" --no-network --no-secrets >/dev/null 2>&1
+  if mount | grep -q 'mac-release-verify'; then
+    fail_msg "a disk image was left mounted after exit"
+  else
+    pass_msg "no disk image is left mounted after exit"
+  fi
+else
+  pass_msg "no disk image is left mounted after exit (no dmg built)"
+fi
+
+echo ""
+if [ "$FAILURES" -eq 0 ]; then
+  echo "  $RAN checks, all passed"
+  echo ""
+  exit 0
+else
+  echo "  $RAN checks, $FAILURES failed"
+  echo ""
+  exit 1
+fi

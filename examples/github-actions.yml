@@ -1,0 +1,32 @@
+# Copy this into .github/workflows/ in your own app's repository.
+#
+# It runs mac-release-verify against the artifact you are about to publish and
+# fails the job before anything reaches a user. --format github turns each
+# finding into a GitHub annotation on the run.
+name: verify release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [created]
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mac-release-verify
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/cyber937/mac-release-verify/main/bin/mac-release-verify \
+            -o /usr/local/bin/mac-release-verify
+          chmod +x /usr/local/bin/mac-release-verify
+
+      # Replace these with however your pipeline produces the artifact.
+      - name: Verify the artifact
+        run: |
+          mac-release-verify "build/MyApp-${{ github.ref_name }}.dmg" \
+            --appcast build/appcast.xml \
+            --dsym build/MyApp.xcarchive \
+            --previous-build "${{ vars.LAST_SHIPPED_BUILD }}" \
+            --format github
