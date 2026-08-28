@@ -311,6 +311,41 @@ else
   skip "target is not a disk image"
 fi
 
+# ========================= 5b. what Gatekeeper actually decides about the image
+# `stapler validate` answers "is there a ticket attached to this file". It does
+# not answer "will this open on the user's Mac". Those two can disagree, and the
+# second one is the answer the user gets, so it is reported on its own.
+#
+# The form of the question matters. A disk image is not executable code, so
+# `spctl --assess --type execute` reports "rejected (the code is valid but does
+# not seem to be an app)" for *every* disk image, including a correctly
+# notarized one. Hand-verifying with that form is the usual way to conclude,
+# wrongly, that notarizing the image did not work. The assessment Gatekeeper
+# performs when the user opens a download is --type open against the primary
+# signature, which is the one asked here.
+
+check "Gatekeeper assessment (disk image)"
+if [ "$IS_DMG" -eq 0 ]; then
+  skip "target is not a disk image"
+elif [ "$CHANNEL" = "app-store" ]; then
+  skip "App Store build; it is not distributed as a download, and the mismatch is already reported above"
+elif [ "$CHANNEL" = "development" ]; then
+  skip "development build, not a distributable artifact"
+else
+  GK_DMG_OUT=$(spctl --assess --type open --context context:primary-signature --verbose=4 "$TARGET" 2>&1)
+  GK_DMG_RC=$?
+  GK_DMG_SRC=$(printf '%s\n' "$GK_DMG_OUT" | grep -m1 '^source=' | sed 's/^source=//')
+  GK_DMG_ONE=$(printf '%s\n' "$GK_DMG_OUT" | tr '\n' ' ' | sed 's/  */ /g; s/ $//')
+  if [ "$GK_DMG_RC" -eq 0 ]; then
+    ok
+    say "        ${C_DIM}Gatekeeper says: ${GK_DMG_SRC:-accepted}${C_OFF}"
+    say "        ${C_DIM}asked with --type open --context context:primary-signature; --type execute reports \"rejected\" for any disk image, notarized or not${C_OFF}"
+  else
+    fail "Gatekeeper rejects the disk image itself: ${GK_DMG_ONE}. This is the decision the user's Mac makes the moment they open the download — they get \"can't be opened because Apple cannot check it for malicious software\" and a Move to Trash button. A notarization ticket on the app inside does not change it." \
+         "Notarize and staple the image, not just the app: xcrun notarytool submit \"$(basename "$TARGET")\" --wait ... && xcrun stapler staple \"$(basename "$TARGET")\". Re-check with: spctl --assess --type open --context context:primary-signature -v \"$(basename "$TARGET")\" — note that --type execute always answers \"rejected\" for a disk image even once notarization is correct, so do not use it to judge the fix."
+  fi
+fi
+
 # ======================================================= 6. disk image signing
 
 check "disk image signature"
