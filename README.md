@@ -164,9 +164,16 @@ that it must not sign, staple or upload anything on your behalf.
 
 ## Contributing
 
-The useful contribution is **a failure mode that actually shipped for you** —
-open an issue describing what went out, what the user saw, and how you would
-have caught it. Checks that come from real incidents are the whole point.
+The useful contribution is **a failure mode that actually shipped for you**.
+There is [a template for it](https://github.com/cyber937/mac-release-verify/issues/new?template=failure-report.yml),
+and it asks three things: what shipped, what the user saw, and what could have
+been read from the artifact instead.
+
+It does not ask for steps to reproduce. If it reproduced on your machine you
+would have caught it before shipping — that is the whole shape of these bugs.
+
+Reports that the tool **failed an artifact that was fine** are just as valuable.
+A checker that fails correct builds teaches people to ignore it.
 
 ## License
 
