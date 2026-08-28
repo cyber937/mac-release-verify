@@ -1,0 +1,82 @@
+name: mac-release-verify
+description: Check a macOS release artifact before you publish it. Read-only — it signs, uploads and modifies nothing.
+author: cyber937
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  artifact:
+    description: Path to the .app, .dmg or .xcarchive to check.
+    required: true
+  appcast:
+    description: Path or URL of a Sparkle appcast to cross-check against the artifact.
+    required: false
+  dsym:
+    description: A .dSYM bundle, or a directory or .xcarchive containing one.
+    required: false
+  previous-build:
+    description: The CFBundleVersion of the last release you shipped, to assert this one increased.
+    required: false
+  no-network:
+    description: Skip every check that touches the network.
+    required: false
+    default: 'false'
+  no-secrets:
+    description: Skip the bundled-credentials scan.
+    required: false
+    default: 'false'
+  fail-on-error:
+    description: Fail the job when a check fails. Set to false to report without failing.
+    required: false
+    default: 'true'
+
+outputs:
+  exit-code:
+    description: 0 when every check passed, 1 when at least one failed.
+    value: ${{ steps.run.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the runner is macOS
+      shell: bash
+      run: |
+        if [ "$(uname -s)" != "Darwin" ]; then
+          echo "::error::mac-release-verify needs a macOS runner — it uses codesign, spctl, stapler and hdiutil."
+          exit 1
+        fi
+
+    - name: Verify the artifact
+      id: run
+      shell: bash
+      env:
+        MRV_ARTIFACT: ${{ inputs.artifact }}
+        MRV_APPCAST: ${{ inputs.appcast }}
+        MRV_DSYM: ${{ inputs.dsym }}
+        MRV_PREVIOUS_BUILD: ${{ inputs.previous-build }}
+        MRV_NO_NETWORK: ${{ inputs.no-network }}
+        MRV_NO_SECRETS: ${{ inputs.no-secrets }}
+        MRV_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: |
+        set -u
+        TOOL="${{ github.action_path }}/bin/mac-release-verify"
+        chmod +x "$TOOL"
+
+        # Values come in through the environment, not through the command line,
+        # so a path with a space or a quote cannot turn into extra arguments.
+        set -- "$MRV_ARTIFACT"
+        [ -n "$MRV_APPCAST" ]        && set -- "$@" --appcast "$MRV_APPCAST"
+        [ -n "$MRV_DSYM" ]           && set -- "$@" --dsym "$MRV_DSYM"
+        [ -n "$MRV_PREVIOUS_BUILD" ] && set -- "$@" --previous-build "$MRV_PREVIOUS_BUILD"
+        [ "$MRV_NO_NETWORK" = "true" ] && set -- "$@" --no-network
+        [ "$MRV_NO_SECRETS" = "true" ] && set -- "$@" --no-secrets
+
+        "$TOOL" "$@" --format github
+        CODE=$?
+        echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"
+
+        if [ "$CODE" -ne 0 ] && [ "$MRV_FAIL_ON_ERROR" = "true" ]; then
+          exit "$CODE"
+        fi
+        exit 0
