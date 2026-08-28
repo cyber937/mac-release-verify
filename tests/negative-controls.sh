@@ -125,6 +125,55 @@ else
   echo "  skip  disk image tests — hdiutil create failed"
 fi
 
+# 6b. a profile-backed entitlement with no provisioning profile ---------------
+# Ad-hoc signing (-s -) needs no certificate, so this fixture builds anywhere,
+# including CI. It reproduces the shape of a real shipped failure: the app is
+# signed, notarization is irrelevant, and it simply will not launch on a machine
+# without the team's profile.
+ENTS_APP="$WORK/Entitled.app"
+mkdir -p "$ENTS_APP/Contents/MacOS"
+/usr/libexec/PlistBuddy \
+  -c "Add :CFBundleExecutable string Entitled" \
+  -c "Add :CFBundleIdentifier string com.example.entitled" \
+  -c "Add :CFBundleShortVersionString string 1.0" \
+  -c "Add :CFBundleVersion string 1" \
+  "$ENTS_APP/Contents/Info.plist" >/dev/null
+cc -o "$ENTS_APP/Contents/MacOS/Entitled" "$WORK/main.c" 2>/dev/null || \
+  printf '#!/bin/sh\nexit 0\n' > "$ENTS_APP/Contents/MacOS/Entitled"
+chmod +x "$ENTS_APP/Contents/MacOS/Entitled"
+cat > "$WORK/ents.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>keychain-access-groups</key><array><string>ABCDE12345.com.example.entitled</string></array>
+  <key>com.apple.security.network.client</key><true/>
+</dict></plist>
+PLIST
+if codesign -s - --entitlements "$WORK/ents.plist" -f "$ENTS_APP" >/dev/null 2>&1; then
+  OUT=$(NO_COLOR=1 "$TOOL" "$ENTS_APP" --no-network --no-secrets 2>&1)
+  expect_check_fails "a profile-backed entitlement with no profile is caught" \
+    "entitlements are backed by a provisioning profile" "$OUT"
+
+  # and the same app without that entitlement must not be flagged
+  cat > "$WORK/ents-ok.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>com.apple.security.network.client</key><true/>
+</dict></plist>
+PLIST
+  codesign -s - --entitlements "$WORK/ents-ok.plist" -f "$ENTS_APP" >/dev/null 2>&1
+  OUT=$(NO_COLOR=1 "$TOOL" "$ENTS_APP" --no-network --no-secrets 2>&1)
+  RAN=$((RAN + 1))
+  if printf '%s' "$OUT" | grep -q "FAIL  entitlements are backed"; then
+    fail_msg "sandbox-only entitlements were wrongly flagged"
+  else
+    pass_msg "entitlements that need no profile are not flagged"
+  fi
+else
+  echo "  skip  entitlement tests — ad-hoc codesign unavailable"
+fi
+
 # 6. missing dSYM -------------------------------------------------------------
 mkdir -p "$WORK/empty-archive"
 OUT=$(NO_COLOR=1 "$TOOL" "$APP" --no-network --no-secrets --dsym "$WORK/empty-archive" 2>&1)

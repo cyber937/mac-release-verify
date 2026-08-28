@@ -31,7 +31,7 @@
 
 set -u
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 
 # ---------------------------------------------------------------- presentation
 
@@ -247,6 +247,33 @@ elif [ "$CHANNEL" = "app-store" ] || [ "$CHANNEL" = "development" ]; then
 else
   fail "The signature has no secure timestamp, so it stops validating once the certificate expires." \
        "Sign with --timestamp (not --timestamp=none)."
+fi
+
+# ============================ 3b. entitlements vs provisioning profile
+# The failure this exists for does not look like a signing problem and cannot be
+# reproduced on the machine that built it. keychain-access-groups and the
+# com.apple.developer.* family have to be granted by a provisioning profile. A
+# developer machine already has the team's profiles installed, so the app opens
+# there. On a machine that does not, launch is refused outright — no Gatekeeper
+# dialog, no crash report, reinstalling changes nothing.
+
+check "entitlements are backed by a provisioning profile"
+ENTITLEMENTS=$(codesign -d --entitlements :- "$APP" 2>/dev/null)
+PROFILE="$APP/Contents/embedded.provisionprofile"
+# com.apple.security.* (sandbox, hardened-runtime exceptions) needs no profile.
+PROFILE_BACKED=$(printf '%s' "$ENTITLEMENTS" \
+  | grep -oE "<key>[^<]+</key>" | sed 's/<[^>]*>//g' \
+  | grep -E '^(keychain-access-groups|application-identifier|com\.apple\.application-identifier|com\.apple\.developer\.)' \
+  | tr '\n' ' ')
+if [ -z "$ENTITLEMENTS" ]; then
+  skip "no entitlements could be read from the signature"
+elif [ -z "$PROFILE_BACKED" ]; then
+  ok
+elif [ -f "$PROFILE" ]; then
+  ok
+else
+  fail "The bundle asks for entitlements that only a provisioning profile can grant (${PROFILE_BACKED}) but carries no Contents/embedded.provisionprofile. macOS refuses to launch it on any machine that does not already have your team's profile installed — which is every machine except a developer's. It opens normally on the machine that built it, so this cannot be reproduced locally: the user just sees \"the application cannot be opened\", reinstalling does not help, and there is no security prompt to explain it." \
+       "Remove the entitlement, or embed a provisioning profile that grants it."
 fi
 
 # ================================================ 4. notarization ticket (app)
