@@ -36,6 +36,7 @@ Each check in this tool is a mistake that actually shipped:
 | The appcast was generated from build settings instead of from the built DMG | The feed advertised a version that did not match the binary behind it |
 | The dSYM was not kept | Every crash report from that version arrived as raw addresses, for the whole life of the release. A dSYM cannot be produced after the fact |
 | A config file stayed in Copy Bundle Resources | The key was inside every copy downloaded, and a released build cannot be recalled |
+| An entitlement that only a provisioning profile can grant, in a build carrying no profile | The app refused to launch. No security prompt, no crash report, reinstalling changed nothing — and it opened normally on the machine that built it |
 
 ## Install
 
@@ -95,18 +96,19 @@ inside a disk image cannot run for anyone who downloads it.
 1. Code signature valid (`--deep --strict`)
 2. Gatekeeper accepts the app
 3. Hardened runtime **and** secure timestamp present
-4. Notarization ticket stapled to the **app**
-5. Notarization ticket stapled to the **disk image**
-6. Disk image itself is signed
-7. `CFBundleShortVersionString` / `CFBundleVersion` present and numerically orderable
-8. Build number actually increased since the last release
-9. Appcast agrees with the artifact — `sparkle:version`, `shortVersionString`, enclosure `length` vs real byte size, `edSignature` present
-10. `SUPublicEDKey` present, so Sparkle can verify signatures at all
-11. Appcast download URL returns 200
-12. dSYM exists and its UUIDs match the shipped binary
-13. Architectures and `LSMinimumSystemVersion`
-14. Embedded frameworks / XPC services / extensions are validly signed
-15. No credential-shaped files inside the bundle
+4. Entitlements that need a provisioning profile are backed by one
+5. Notarization ticket stapled to the **app**
+6. Notarization ticket stapled to the **disk image**
+7. Disk image itself is signed
+8. `CFBundleShortVersionString` / `CFBundleVersion` present and numerically orderable
+9. Build number actually increased since the last release
+10. Appcast agrees with the artifact — `sparkle:version`, `shortVersionString`, enclosure `length` vs real byte size, `edSignature` present
+11. `SUPublicEDKey` present, so Sparkle can verify signatures at all
+12. Appcast download URL returns 200
+13. dSYM exists and its UUIDs match the shipped binary
+14. Architectures and `LSMinimumSystemVersion`
+15. Embedded frameworks / XPC services / extensions are validly signed
+16. No credential-shaped files inside the bundle
 
 ## What it does not do
 
@@ -128,7 +130,7 @@ nothing. Every check is therefore exercised against a deliberately broken
 artifact built on the fly — unsigned app, unstapled disk image, an appcast that
 disagrees with the binary, a build number that did not move, a missing dSYM, a
 credential left in Resources. No signing identity, Apple account or network
-needed. 18 assertions, and they run on `macos-latest` in CI under the same
+needed. 20 assertions, and they run on `macos-latest` in CI under the same
 bash 3.2 the tool targets.
 
 ## Use it from an AI agent
