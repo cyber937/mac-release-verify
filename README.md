@@ -78,6 +78,18 @@ usage error — so it drops straight into a release script:
   --previous-build "$LAST_SHIPPED_BUILD" || exit 1
 ```
 
+## It knows how you are shipping
+
+An App Store build is signed with an Apple Distribution certificate and is
+re-signed by Apple after upload, so it legitimately has no Developer ID
+notarization ticket, no secure timestamp, and is rejected by `spctl`. Reporting
+those as failures would mean reporting a correct artifact as broken, so the
+checks that only apply to direct distribution are skipped and the reason is
+printed.
+
+The reverse is a real failure and is reported as one: an App Store build found
+inside a disk image cannot run for anyone who downloads it.
+
 ## What it checks
 
 1. Code signature valid (`--deep --strict`)

@@ -31,7 +31,7 @@
 
 set -u
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 # ---------------------------------------------------------------- presentation
 
@@ -173,6 +173,26 @@ ED_PUBKEY=$(plist_get SUPublicEDKey)
 FEED_URL=$(plist_get SUFeedURL)
 BINARY="$APP/Contents/MacOS/$EXECUTABLE_NAME"
 
+# Which way is this build being distributed? An App Store build is signed with
+# an Apple Distribution certificate and is re-signed by Apple after upload, so
+# it legitimately has no Developer ID notarization ticket, no secure timestamp,
+# and is rejected by spctl. Reporting those as failures would be reporting a
+# correct artifact as broken.
+AUTHORITY=$(codesign -dvv "$APP" 2>&1 | grep -m1 '^Authority=' | sed 's/^Authority=//')
+case "$AUTHORITY" in
+  "Developer ID Application"*)                              CHANNEL="developer-id" ;;
+  "Apple Distribution"*|"3rd Party Mac Developer Application"*) CHANNEL="app-store" ;;
+  "Apple Development"*|"Mac Developer"*)                    CHANNEL="development" ;;
+  *)                                                        CHANNEL="unknown" ;;
+esac
+
+case "$CHANNEL" in
+  developer-id) CHANNEL_LABEL="direct distribution (Developer ID)" ;;
+  app-store)    CHANNEL_LABEL="App Store (Apple Distribution)" ;;
+  development)  CHANNEL_LABEL="development build" ;;
+  *)            CHANNEL_LABEL="unrecognised signing authority" ;;
+esac
+
 # --------------------------------------------------------------------- header
 
 say ""
@@ -180,6 +200,7 @@ say "${C_BLD}mac-release-verify${C_OFF} $VERSION"
 say ""
 say "  target   $(basename "$TARGET")"
 say "  app      $(basename "$APP")  ${C_BLD}${SHORT_VERSION:-?} (${BUILD_VERSION:-?})${C_OFF}"
+say "  channel  ${CHANNEL_LABEL}"
 say ""
 
 # ============================================================== 1. signature
@@ -196,12 +217,18 @@ fi
 # ============================================================== 2. gatekeeper
 
 check "Gatekeeper assessment (app)"
+if [ "$CHANNEL" = "app-store" ]; then
+  skip "App Store builds are re-signed by Apple; Gatekeeper evaluates the installed copy, not this one"
+elif [ "$CHANNEL" = "development" ]; then
+  skip "development build, not a distributable artifact"
+else
 GK_OUT=$(spctl --assess --type exec --verbose=4 "$APP" 2>&1)
 if [ $? -eq 0 ]; then
   ok
 else
   fail "Gatekeeper rejects the app: ${GK_OUT}. Users see \"can't be opened because Apple cannot check it for malicious software\"." \
        "Notarize the app, then: xcrun stapler staple \"\$APP\""
+fi
 fi
 
 # ========================================================== 3. hardened runtime
@@ -215,6 +242,8 @@ if [ "$HAS_RUNTIME" -gt 0 ] && [ "$HAS_TIMESTAMP" -gt 0 ]; then
 elif [ "$HAS_RUNTIME" -eq 0 ]; then
   fail "The app is signed without the hardened runtime. Apple's notary service rejects such builds." \
        "Add --options runtime when signing (ENABLE_HARDENED_RUNTIME = YES)."
+elif [ "$CHANNEL" = "app-store" ] || [ "$CHANNEL" = "development" ]; then
+  warn "No secure timestamp, which is expected for this channel — Apple applies its own signature after upload."
 else
   fail "The signature has no secure timestamp, so it stops validating once the certificate expires." \
        "Sign with --timestamp (not --timestamp=none)."
@@ -223,7 +252,11 @@ fi
 # ================================================ 4. notarization ticket (app)
 
 check "notarization ticket (app)"
-if xcrun stapler validate "$APP" >/dev/null 2>&1; then
+if [ "$CHANNEL" = "app-store" ]; then
+  skip "App Store builds are notarized by Apple during processing, not stapled here"
+elif [ "$CHANNEL" = "development" ]; then
+  skip "development build, not a distributable artifact"
+elif xcrun stapler validate "$APP" >/dev/null 2>&1; then
   ok
 else
   fail "The app has no stapled notarization ticket. On a Mac that cannot reach Apple's notary service the app will not open at all." \
@@ -237,7 +270,10 @@ fi
 # chance to matter.
 
 check "notarization ticket (disk image)"
-if [ "$IS_DMG" -eq 1 ]; then
+if [ "$IS_DMG" -eq 1 ] && [ "$CHANNEL" = "app-store" ]; then
+  fail "This disk image contains an App Store build (signed with $AUTHORITY). An App Store build cannot be distributed outside the App Store — it is re-signed by Apple and will not run for anyone who downloads it directly." \
+       "Export with the Developer ID method for direct distribution."
+elif [ "$IS_DMG" -eq 1 ]; then
   if xcrun stapler validate "$TARGET" >/dev/null 2>&1; then
     ok
   else
