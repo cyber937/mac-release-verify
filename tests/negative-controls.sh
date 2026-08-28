@@ -196,6 +196,57 @@ else
   echo "  skip  entitlement tests — ad-hoc codesign unavailable"
 fi
 
+# 6c. a loose unsigned dylib next to a signed app -----------------------------
+# The shape of a real notarization rejection: the app is signed, the loose
+# .dylib files in Contents/Frameworks are not, and a re-sign pass that walks
+# only *.framework and *.xpc never touches them.
+DYLIB_APP="$WORK/Loose.app"
+mkdir -p "$DYLIB_APP/Contents/MacOS" "$DYLIB_APP/Contents/Frameworks"
+/usr/libexec/PlistBuddy \
+  -c "Add :CFBundleExecutable string Loose" \
+  -c "Add :CFBundleIdentifier string com.example.loose" \
+  -c "Add :CFBundleShortVersionString string 1.0" \
+  -c "Add :CFBundleVersion string 1" \
+  "$DYLIB_APP/Contents/Info.plist" >/dev/null
+cc -o "$DYLIB_APP/Contents/MacOS/Loose" "$WORK/main.c" 2>/dev/null
+printf 'int helper(void){return 1;}\n' > "$WORK/lib.c"
+if cc -dynamiclib -o "$DYLIB_APP/Contents/Frameworks/libhelper.dylib" "$WORK/lib.c" 2>/dev/null \
+   && codesign -s - -f "$DYLIB_APP/Contents/MacOS/Loose" >/dev/null 2>&1 \
+   && codesign -s - -f "$DYLIB_APP" >/dev/null 2>&1; then
+  codesign --remove-signature "$DYLIB_APP/Contents/Frameworks/libhelper.dylib" >/dev/null 2>&1
+  OUT=$(NO_COLOR=1 "$TOOL" "$DYLIB_APP" --no-network --no-secrets 2>&1)
+  expect_check_fails "an unsigned loose dylib is caught" \
+    "every Mach-O in the bundle is signed like the app" "$OUT"
+
+  RAN=$((RAN + 1))
+  if printf '%s' "$OUT" | grep -q "libhelper.dylib"; then
+    pass_msg "the failure names the offending file"
+  else
+    fail_msg "the failure did not name libhelper.dylib"
+  fi
+
+  # and once it is signed like everything else, it must stop being reported
+  codesign -s - -f "$DYLIB_APP/Contents/Frameworks/libhelper.dylib" >/dev/null 2>&1
+  codesign -s - -f "$DYLIB_APP" >/dev/null 2>&1
+  OUT=$(NO_COLOR=1 "$TOOL" "$DYLIB_APP" --no-network --no-secrets 2>&1)
+  RAN=$((RAN + 1))
+  if printf '%s' "$OUT" | grep -q "FAIL  every Mach-O"; then
+    fail_msg "a consistently signed bundle was still flagged"
+  else
+    pass_msg "a consistently signed bundle is not flagged"
+  fi
+
+  # universal binaries must not be counted several times, once per architecture
+  RAN=$((RAN + 1))
+  if printf '%s' "$OUT" | grep -qE "[0-9]+ Mach-O files, all signed"; then
+    pass_msg "the pass line reports how many Mach-O files were inspected"
+  else
+    fail_msg "the pass line did not report a count"
+  fi
+else
+  echo "  skip  loose dylib tests — cc or ad-hoc codesign unavailable"
+fi
+
 # 6. missing dSYM -------------------------------------------------------------
 mkdir -p "$WORK/empty-archive"
 OUT=$(NO_COLOR=1 "$TOOL" "$APP" --no-network --no-secrets --dsym "$WORK/empty-archive" 2>&1)

@@ -31,7 +31,7 @@
 
 set -u
 
-VERSION="0.1.3"
+VERSION="0.1.4"
 
 # ---------------------------------------------------------------- presentation
 
@@ -542,25 +542,59 @@ else
   warn "LSMinimumSystemVersion is not set, so macOS will let the app launch on systems you never tested."
 fi
 
-# ================================================ 13. embedded code is signed
+# ============================== 13. every Mach-O is signed the way the app is
+# `codesign --verify --deep` checks that nested signatures are *valid*. It does
+# not check that they were made with the same certificate. A loose dylib that
+# kept the Apple Development signature it inherited from the Xcode archive is
+# validly signed and will still make Apple's notary service reject the entire
+# submission — "not signed with a valid Developer ID certificate", once per file.
+#
+# Walking framework and .xpc wrappers is not enough: the files this happens to
+# sit loose in Contents/Frameworks and are not wrapped in anything.
 
-check "embedded frameworks and helpers signed"
-EMBEDDED=$(find "$APP/Contents" -maxdepth 3 \( -name '*.framework' -o -name '*.xpc' -o -name '*.appex' \) -type d 2>/dev/null)
-if [ -z "$EMBEDDED" ]; then
-  skip "no embedded frameworks, XPC services or extensions"
+check "every Mach-O in the bundle is signed like the app"
+# `file` prints one line per architecture for a universal binary, each with a
+# "(for architecture x86_64)" suffix that is not part of the path. Strip it and
+# de-duplicate, or every fat binary becomes several paths that do not exist.
+MACHO=$(find "$APP/Contents" -type f -print0 2>/dev/null \
+  | xargs -0 file 2>/dev/null | grep 'Mach-O' \
+  | sed 's/ (for architecture [^)]*)//' | sed 's/:[[:space:]]*Mach-O.*$//' | sort -u)
+if [ -z "$MACHO" ]; then
+  skip "no Mach-O files found in the bundle"
 else
-  BAD=""
-  while IFS= read -r e; do
-    [ -n "$e" ] || continue
-    codesign --verify --strict "$e" >/dev/null 2>&1 || BAD="${BAD}$(basename "$e") "
+  MACHO_COUNT=0; UNSIGNED=""; MISMATCH=""; NO_TS=""; MISMATCH_AUTH=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    MACHO_COUNT=$((MACHO_COUNT + 1))
+    INFO=$(codesign -dvv "$f" 2>&1)
+    if printf '%s' "$INFO" | grep -q 'not signed at all'; then
+      UNSIGNED="${UNSIGNED}$(basename "$f") "
+      continue
+    fi
+    FA=$(printf '%s' "$INFO" | grep -m1 '^Authority=' | sed 's/^Authority=//')
+    if [ -n "$AUTHORITY" ] && [ -n "$FA" ] && [ "$FA" != "$AUTHORITY" ]; then
+      MISMATCH="${MISMATCH}$(basename "$f") "
+      MISMATCH_AUTH="$FA"
+    fi
+    if [ "$CHANNEL" = "developer-id" ] && ! printf '%s' "$INFO" | grep -q 'Timestamp='; then
+      NO_TS="${NO_TS}$(basename "$f") "
+    fi
   done <<EOF
-$EMBEDDED
+$MACHO
 EOF
-  if [ -z "$BAD" ]; then
-    ok
-  else
-    fail "Embedded code is not validly signed: $BAD. The app will fail to launch, or fail notarization." \
+
+  if [ -n "$UNSIGNED" ]; then
+    fail "Code inside the bundle is not signed at all: ${UNSIGNED}. The app will fail to launch, and Apple's notary service rejects the submission." \
          "Sign nested code inside-out, deepest first, before signing the app."
+  elif [ -n "$MISMATCH" ]; then
+    fail "${MISMATCH}carry a different certificate than the app: \"${MISMATCH_AUTH}\" instead of \"${AUTHORITY}\". Each of these is validly signed on its own, so --deep --strict passes — but Apple's notary service rejects the whole submission, once per file, and you find out after the upload." \
+         "Re-sign every Mach-O with the same identity, deepest first. Loose .dylib files are easy to miss: a re-sign pass that walks only *.framework and *.xpc will skip them."
+  elif [ -n "$NO_TS" ]; then
+    fail "${NO_TS}are signed without a secure timestamp. Apple's notary service rejects them, and a signature without one stops validating when the certificate expires." \
+         "Sign with --timestamp (not --timestamp=none), including the nested binaries."
+  else
+    ok
+    say "        ${C_DIM}${MACHO_COUNT} Mach-O files, all signed with the same identity${C_OFF}"
   fi
 fi
 
