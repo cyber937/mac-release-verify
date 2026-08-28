@@ -4,8 +4,8 @@
 class MacReleaseVerify < Formula
   desc "Check a macOS release artifact before you ship it"
   homepage "https://sailmanifest.app"
-  url "https://github.com/cyber937/mac-release-verify/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "a67aa60fb5ddeda512993a1c5607ab5ae399962191f4244485df25b45864319a"
+  url "https://github.com/cyber937/mac-release-verify/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "06cf1859a1ea677ebd7fc0e4058bb05fea65e495068fed862ee22ad812d3831a"
   license "MIT"
 
   def install
