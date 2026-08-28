@@ -264,7 +264,7 @@ PROFILE="$APP/Contents/embedded.provisionprofile"
 PROFILE_BACKED=$(printf '%s' "$ENTITLEMENTS" \
   | grep -oE "<key>[^<]+</key>" | sed 's/<[^>]*>//g' \
   | grep -E '^(keychain-access-groups|application-identifier|com\.apple\.application-identifier|com\.apple\.developer\.)' \
-  | tr '\n' ' ')
+  | tr '\n' ',' | sed 's/,$//; s/,/, /g')
 if [ -z "$ENTITLEMENTS" ]; then
   skip "no entitlements could be read from the signature"
 elif [ -z "$PROFILE_BACKED" ]; then
