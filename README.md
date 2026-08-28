@@ -38,6 +38,7 @@ nothing failed:
 | The appcast was generated from build settings instead of from the built DMG | The feed advertised a version that did not match the binary behind it |
 | The dSYM was not kept | Every crash report from that version arrived as raw addresses, for the whole life of the release. A dSYM cannot be produced after the fact |
 | A config file stayed in Copy Bundle Resources | The key was inside every copy downloaded, and a released build cannot be recalled |
+| Loose `.dylib` files in `Contents/Frameworks` kept the Apple Development signature from the Xcode archive | Each was validly signed, so `--deep --strict` passed. Apple's notary service rejected the whole submission, once per file, after the upload |
 | An entitlement that only a provisioning profile can grant, in a build carrying no profile | The app refused to launch. No security prompt, no crash report, reinstalling changed nothing — and it opened normally on the machine that built it |
 | A DMG that was signed and looked fine to `codesign`, but was never notarized | Gatekeeper refused to open the download. The signature check and the ticket check had both been read as "probably fine"; only asking Gatekeeper gave the answer the user got |
 
