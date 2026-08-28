@@ -27,7 +27,9 @@ None of the mistakes below make a build fail. The compiler is happy, the archive
 succeeds, the upload goes through, CI stays green. You find out from a user, or
 from a crash you cannot read, or from an update that never arrives.
 
-Each check in this tool is a mistake that actually shipped:
+Some of the checks here are the obvious ones — a valid signature, a stapled
+ticket. These are the ones that exist because a release went out broken and
+nothing failed:
 
 | What shipped | What the user got |
 |---|---|
@@ -184,8 +186,8 @@ not the name or the branding.
 
 ## Not a guarantee
 
-These checks come from mistakes that actually shipped. They are **not a complete
-list of everything that can go wrong with a macOS release**, and a clean run does
+Several of these checks exist because a release shipped broken. They are **not a
+complete list of everything that can go wrong with a macOS release**, and a clean run does
 not mean the release is correct — only that these particular mistakes are absent.
 Know of one that is missing? See *Contributing*.
 
