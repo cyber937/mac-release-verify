@@ -159,6 +159,26 @@ credential left in Resources, a signed disk image that Gatekeeper still refuses.
 No signing identity, Apple account or network needed. 23 assertions, and they run
 on `macos-latest` in CI under the same bash 3.2 the tool targets.
 
+## Use it in CI
+
+```yaml
+- uses: cyber937/mac-release-verify@v1
+  with:
+    artifact: build/MyApp.dmg
+    appcast: build/appcast.xml
+    dsym: build/MyApp.xcarchive
+    previous-build: ${{ vars.LAST_SHIPPED_BUILD }}
+```
+
+Needs a macOS runner — it uses `codesign`, `spctl`, `stapler` and `hdiutil`.
+Findings become annotations on the run, and the job fails when a check fails.
+Set `fail-on-error: false` to report without failing while you get a first
+reading on an existing release.
+
+The action is exercised in this repo's own CI against a deliberately broken
+fixture, including one with a space in its path — an action nobody has run is
+not an action.
+
 ## Use it from an AI agent
 
 `skills/mac-release-verify/` is a Claude Agent Skill. Point your agent at it and

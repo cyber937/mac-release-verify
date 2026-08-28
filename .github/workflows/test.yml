@@ -15,3 +15,50 @@ jobs:
         run: /bin/bash -n bin/mac-release-verify
       - name: Negative controls
         run: ./tests/negative-controls.sh
+
+  action:
+    # An action nobody has run is not an action. This uses the one in this repo
+    # against a deliberately broken fixture and asserts it reports the failure.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build a broken fixture
+        run: |
+          set -eu
+          APP="fixture/Broken.app"
+          mkdir -p "$APP/Contents/MacOS"
+          /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleExecutable string Broken" \
+            -c "Add :CFBundleIdentifier string com.example.broken" \
+            -c "Add :CFBundleShortVersionString string 1.0" \
+            -c "Add :CFBundleVersion string 42" \
+            "$APP/Contents/Info.plist"
+          printf 'int main(void){return 0;}\n' > /tmp/main.c
+          cc -o "$APP/Contents/MacOS/Broken" /tmp/main.c
+          echo "APP=$APP" >> "$GITHUB_ENV"
+
+      - name: Run the action
+        id: verify
+        uses: ./
+        with:
+          artifact: ${{ env.APP }}
+          previous-build: '42'
+          no-network: 'true'
+          fail-on-error: 'false'
+
+      - name: The action must have reported the failure
+        run: |
+          set -eu
+          echo "exit-code was '${{ steps.verify.outputs.exit-code }}'"
+          if [ "${{ steps.verify.outputs.exit-code }}" != "1" ]; then
+            echo "::error::the action did not report a failure on a broken fixture"
+            exit 1
+          fi
+
+      - name: A path containing a space must not break the invocation
+        uses: ./
+        with:
+          artifact: fixture/Broken.app
+          no-network: 'true'
+          fail-on-error: 'false'
