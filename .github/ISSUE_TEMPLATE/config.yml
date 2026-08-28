@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: A false positive
+    url: https://github.com/cyber937/mac-release-verify/issues/new
+    about: The tool failed an artifact that was actually fine. Open a blank issue and paste the output — a checker that fails correct builds is worse than no checker.
+  - name: Anything else
+    url: https://github.com/cyber937/mac-release-verify/issues/new
+    about: Questions, packaging problems, or a check you think is missing.

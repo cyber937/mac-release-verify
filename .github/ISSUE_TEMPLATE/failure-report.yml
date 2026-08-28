@@ -1,0 +1,85 @@
+name: A failure that shipped
+description: Something went out, a user hit it, and nothing turned red. This is the most useful thing you can send.
+labels: ["incident-derived"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Every check in this tool exists because a release went out broken and nothing
+        failed. If that has happened to you, describing it here is worth more than a
+        feature request.
+
+        **You do not need a reproduction.** Most of these failures cannot be reproduced
+        on the machine that produced the build — that is exactly why they ship. Three
+        things are enough.
+
+  - type: textarea
+    id: shipped
+    attributes:
+      label: What shipped
+      description: >
+        What was in the artifact. Signing, entitlements, notarization, version numbers,
+        appcast, whatever turned out to matter. Redact anything you need to.
+      placeholder: |
+        A Developer ID build with a keychain-access-groups entitlement and no
+        embedded provisioning profile.
+    validations:
+      required: true
+
+  - type: textarea
+    id: symptom
+    attributes:
+      label: What the user saw
+      description: >
+        In their words if you still have them. The exact dialog text is often the only
+        thing that distinguishes one cause from another.
+      placeholder: |
+        "The application cannot be opened." No security warning. Reinstalling
+        didn't help. It had worked before.
+    validations:
+      required: true
+
+  - type: textarea
+    id: catchable
+    attributes:
+      label: How you would have caught it
+      description: >
+        What could have been read from the artifact before it went out? If you do not
+        know, say so — working that out is often the interesting part.
+      placeholder: |
+        The entitlement is in the signature and the profile is a file that either
+        exists or doesn't. Both are readable from the bundle.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: How was it distributed?
+      description: Some failures are correct in one channel and fatal in the other.
+      options:
+        - Direct download (Developer ID)
+        - Mac App Store
+        - Both
+        - Not sure
+    validations:
+      required: false
+
+  - type: textarea
+    id: tool-output
+    attributes:
+      label: Does the current version catch it?
+      description: >
+        If you still have the broken artifact, `mac-release-verify` it and paste the
+        output. A miss is the useful answer here — that is the gap worth closing.
+      render: text
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **Not asked on purpose:** severity, priority, and steps to reproduce on your
+        machine. If it reproduced on your machine you would have caught it before
+        shipping.
