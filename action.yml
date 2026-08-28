@@ -72,8 +72,11 @@ runs:
         [ "$MRV_NO_NETWORK" = "true" ] && set -- "$@" --no-network
         [ "$MRV_NO_SECRETS" = "true" ] && set -- "$@" --no-secrets
 
-        "$TOOL" "$@" --format github
-        CODE=$?
+        # GitHub runs composite steps with `bash -eo pipefail`, so a non-zero
+        # exit from the tool would end this script before the next line and
+        # fail-on-error: false would never be honoured.
+        CODE=0
+        "$TOOL" "$@" --format github || CODE=$?
         echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"
 
         if [ "$CODE" -ne 0 ] && [ "$MRV_FAIL_ON_ERROR" = "true" ]; then
