@@ -113,6 +113,8 @@ EOF
   OUT=$(NO_COLOR=1 "$TOOL" "$WORK/Broken.dmg" --appcast "$WORK/appcast.xml" --no-network --no-secrets 2>&1)
   expect_check_fails "an unstapled disk image is caught"   "notarization ticket (disk image)" "$OUT"
   expect_check_fails "an unsigned disk image is caught"    "disk image signature"             "$OUT"
+  expect_check_fails "a disk image Gatekeeper rejects is caught" \
+    "Gatekeeper assessment (disk image)" "$OUT"
   expect_check_fails "an appcast that disagrees is caught" "appcast agreement"                "$OUT"
 
   RAN=$((RAN + 1))
@@ -120,6 +122,26 @@ EOF
     pass_msg "the appcast failure names the actual mismatch"
   else
     fail_msg "the appcast failure did not name the version mismatch"
+  fi
+
+  # 5b. the two disk-image checks can disagree, which is why both exist.
+  # Ad-hoc signing (-s -) needs no certificate, so this builds anywhere. The
+  # image is then validly signed — `codesign --verify` is happy — while
+  # Gatekeeper still refuses to open it. A tool that only ran codesign would
+  # call this artifact fine and it would fail for every user who downloaded it.
+  cp "$WORK/Broken.dmg" "$WORK/Adhoc.dmg"
+  if codesign -s - -f "$WORK/Adhoc.dmg" >/dev/null 2>&1; then
+    OUT=$(NO_COLOR=1 "$TOOL" "$WORK/Adhoc.dmg" --no-network --no-secrets 2>&1)
+    RAN=$((RAN + 1))
+    if printf '%s' "$OUT" | grep -q "PASS  disk image signature"; then
+      pass_msg "a signed disk image passes the signature check"
+    else
+      fail_msg "the ad-hoc signed disk image did not pass the signature check"
+    fi
+    expect_check_fails "Gatekeeper still rejects a signed but unnotarized disk image" \
+      "Gatekeeper assessment (disk image)" "$OUT"
+  else
+    echo "  skip  ad-hoc disk image test — codesign -s - unavailable"
   fi
 else
   echo "  skip  disk image tests — hdiutil create failed"

@@ -37,6 +37,7 @@ Each check in this tool is a mistake that actually shipped:
 | The dSYM was not kept | Every crash report from that version arrived as raw addresses, for the whole life of the release. A dSYM cannot be produced after the fact |
 | A config file stayed in Copy Bundle Resources | The key was inside every copy downloaded, and a released build cannot be recalled |
 | An entitlement that only a provisioning profile can grant, in a build carrying no profile | The app refused to launch. No security prompt, no crash report, reinstalling changed nothing — and it opened normally on the machine that built it |
+| A DMG that was signed and looked fine to `codesign`, but was never notarized | Gatekeeper refused to open the download. The signature check and the ticket check had both been read as "probably fine"; only asking Gatekeeper gave the answer the user got |
 
 ## Install
 
@@ -99,16 +100,38 @@ inside a disk image cannot run for anyone who downloads it.
 4. Entitlements that need a provisioning profile are backed by one
 5. Notarization ticket stapled to the **app**
 6. Notarization ticket stapled to the **disk image**
-7. Disk image itself is signed
-8. `CFBundleShortVersionString` / `CFBundleVersion` present and numerically orderable
-9. Build number actually increased since the last release
-10. Appcast agrees with the artifact — `sparkle:version`, `shortVersionString`, enclosure `length` vs real byte size, `edSignature` present
-11. `SUPublicEDKey` present, so Sparkle can verify signatures at all
-12. Appcast download URL returns 200
-13. dSYM exists and its UUIDs match the shipped binary
-14. Architectures and `LSMinimumSystemVersion`
-15. Embedded frameworks / XPC services / extensions are validly signed
-16. No credential-shaped files inside the bundle
+7. Gatekeeper accepts the **disk image** — the decision the user's Mac makes at download time
+8. Disk image itself is signed
+9. `CFBundleShortVersionString` / `CFBundleVersion` present and numerically orderable
+10. Build number actually increased since the last release
+11. Appcast agrees with the artifact — `sparkle:version`, `shortVersionString`, enclosure `length` vs real byte size, `edSignature` present
+12. `SUPublicEDKey` present, so Sparkle can verify signatures at all
+13. Appcast download URL returns 200
+14. dSYM exists and its UUIDs match the shipped binary
+15. Architectures and `LSMinimumSystemVersion`
+16. Embedded frameworks / XPC services / extensions are validly signed
+17. No credential-shaped files inside the bundle
+
+### Asking Gatekeeper about a disk image
+
+Checks 6 and 7 are not the same question and they can disagree. `stapler
+validate` asks whether a ticket is attached to the file; Gatekeeper asks whether
+it will let the download open. When they disagree, the second answer is the one
+your users get — an unnotarized disk image that had passed the other two checks
+is what this check was added for.
+
+The form of the question matters:
+
+```sh
+spctl --assess --type open --context context:primary-signature -v MyApp.dmg   # this one
+spctl --assess --type execute -v MyApp.dmg                                    # not this one
+```
+
+A disk image is not executable code, so `--type execute` answers `rejected (the
+code is valid but does not seem to be an app)` for **every** disk image,
+including a correctly notarized one. Verifying by hand with that form is the
+usual way to conclude, wrongly, that notarizing the image did not work. The tool
+prints which form it used.
 
 ## What it does not do
 
@@ -129,9 +152,9 @@ A checker that only ever reports PASS is indistinguishable from one that does
 nothing. Every check is therefore exercised against a deliberately broken
 artifact built on the fly — unsigned app, unstapled disk image, an appcast that
 disagrees with the binary, a build number that did not move, a missing dSYM, a
-credential left in Resources. No signing identity, Apple account or network
-needed. 20 assertions, and they run on `macos-latest` in CI under the same
-bash 3.2 the tool targets.
+credential left in Resources, a signed disk image that Gatekeeper still refuses.
+No signing identity, Apple account or network needed. 23 assertions, and they run
+on `macos-latest` in CI under the same bash 3.2 the tool targets.
 
 ## Use it from an AI agent
 
