@@ -45,7 +45,7 @@ nothing failed:
 ## Install
 
 ```sh
-brew install cyber937/tap/mac-release-verify     # (coming with v0.1.0)
+brew install cyber937/tap/mac-release-verify
 ```
 
 or just drop the script somewhere on your `PATH` — it is a single file:
